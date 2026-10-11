@@ -11,8 +11,11 @@
   așa că microfonul nu poate fi folosit acolo. Pagina aceasta se publică separat (de exemplu pe GitHub Pages),
   se deschide din aplicație într-o filă nouă, înregistrează și trimite fișierul înapoi aplicației (postMessage),
   apoi se închide. Nu încarcă nimic pe internet și nu păstrează înregistrarea.
+  Formatul trimis: MP3 (se deschide pe orice telefon și în Google Drive). Codarea MP3 o face librăria lamejs (LGPL),
+  încărcată de pe jsDelivr cu verificare de integritate; dacă nu se poate încărca, înregistrarea pleacă în format WAV.
   Adresa ei se trece în aplicație la Administrare → Setări → „Pagina de înregistrare a mesajelor vocale”.
 -->
+<script src="https://cdn.jsdelivr.net/npm/lamejs@1.2.1/lame.min.js" integrity="sha384-xuasJXVcyv3hZq0eYpelEkBC8l4yufatZXDsKuyCU2rqfhDCb+ftuE/mSfZAteiK" crossorigin="anonymous" defer></script>
 <style>
   :root { --ink: #1D2B4F; --ink-2: #4A5672; --page: #E8ECF2; --sheet: #FCFDFE; --line: #C8D1DF; --danger: #A3352A; --ok: #3F6E2C; --focus: #2F62CC; }
   @media (prefers-color-scheme: dark) { :root { --ink: #E3E8F1; --ink-2: #A9B3C7; --page: #0F1626; --sheet: #161F33; --line: #2B3651; --danger: #F2988A; --ok: #A5CF88; --focus: #8FB0FF; } }
@@ -63,7 +66,41 @@
   var MAX = Math.min(600, Math.max(10, parseInt(q.max, 10) || 180));
   var $ = function (id) { return document.getElementById(id); };
   var rec = $('rec'), time = $('time'), play = $('play'), after = $('after'), err = $('err'), hint = $('hint');
-  var mr = null, stream = null, chunks = [], blob = null, t0 = 0, timer = null, fmt = null;
+  var mr = null, stream = null, chunks = [], blob = null, t0 = 0, timer = null, fmt = null, outExt = 'mp3';
+
+  /**
+   * Înregistrarea browserului (WebM/Opus pe Android, M4A pe iPhone) se transformă într-un fișier audio clasic:
+   * mono, 22 050 Hz → MP3 la 48 kbps (~350 KB/minut); fără lamejs → WAV 16 kHz (~1,9 MB/minut).
+   */
+  function toClassic(src) {
+    var AC = window.AudioContext || window.webkitAudioContext, OAC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+    if (!AC || !OAC) return Promise.reject(new Error('fără Web Audio'));
+    var mp3 = !!window.lamejs, rate = mp3 ? 22050 : 16000;
+    return src.arrayBuffer().then(function (buf) {
+      var ac = new AC();
+      return new Promise(function (res, rej) { ac.decodeAudioData(buf, res, rej); }).then(function (ab) { if (ac.close) ac.close(); return ab; });
+    }).then(function (ab) {
+      var off = new OAC(1, Math.max(1, Math.ceil(ab.duration * rate)), rate);
+      var node = off.createBufferSource(); node.buffer = ab; node.connect(off.destination); node.start(0);
+      return off.startRendering ? new Promise(function (res) { var r = off.startRendering(); if (r && r.then) r.then(res); else off.oncomplete = function (e) { res(e.renderedBuffer); }; }) : null;
+    }).then(function (rb) {
+      var f = rb.getChannelData(0), pcm = new Int16Array(f.length);
+      for (var i = 0; i < f.length; i++) { var v = Math.max(-1, Math.min(1, f[i])); pcm[i] = v < 0 ? v * 0x8000 : v * 0x7FFF; }
+      if (mp3) {
+        var enc = new lamejs.Mp3Encoder(1, rate, 48), parts = [];
+        for (var j = 0; j < pcm.length; j += 1152) { var b = enc.encodeBuffer(pcm.subarray(j, j + 1152)); if (b.length) parts.push(new Uint8Array(b)); }
+        var e = enc.flush(); if (e.length) parts.push(new Uint8Array(e));
+        outExt = 'mp3';
+        return new Blob(parts, { type: 'audio/mpeg' });
+      }
+      var hdr = new DataView(new ArrayBuffer(44)), w = function (o, t) { for (var k = 0; k < t.length; k++) hdr.setUint8(o + k, t.charCodeAt(k)); };
+      w(0, 'RIFF'); hdr.setUint32(4, 36 + pcm.length * 2, true); w(8, 'WAVE'); w(12, 'fmt '); hdr.setUint32(16, 16, true); hdr.setUint16(20, 1, true);
+      hdr.setUint16(22, 1, true); hdr.setUint32(24, rate, true); hdr.setUint32(28, rate * 2, true); hdr.setUint16(32, 2, true); hdr.setUint16(34, 16, true);
+      w(36, 'data'); hdr.setUint32(40, pcm.length * 2, true);
+      outExt = 'wav';
+      return new Blob([hdr.buffer, pcm.buffer], { type: 'audio/wav' });
+    });
+  }
 
   function fail(msg) { err.textContent = msg; err.hidden = false; }
   if (!ORIGIN || !NONCE || !window.opener) {
@@ -90,9 +127,15 @@
         stream.getTracks().forEach(function (t) { t.stop(); });
         clearInterval(timer);
         rec.classList.remove('on'); rec.setAttribute('aria-label', 'Începe înregistrarea');
-        blob = new Blob(chunks, { type: fmt[0].split(';')[0] });
-        play.src = URL.createObjectURL(blob); play.hidden = false; after.hidden = false;
-        hint.textContent = 'Ascultă înregistrarea și trimite-o sau înregistrează din nou.';
+        var raw = new Blob(chunks, { type: fmt[0].split(';')[0] });
+        hint.textContent = 'Se pregătește fișierul audio…';
+        rec.disabled = true;
+        toClassic(raw).catch(function () { outExt = fmt[1]; return raw; }).then(function (b) {   // fără conversie: formatul original
+          blob = b;
+          rec.disabled = false;
+          play.src = URL.createObjectURL(blob); play.hidden = false; after.hidden = false;
+          hint.textContent = 'Ascultă înregistrarea și trimite-o sau înregistrează din nou.';
+        });
       };
       mr.start(1000);
       t0 = Date.now(); timer = setInterval(tick, 250); tick();
@@ -110,7 +153,7 @@
   $('send').addEventListener('click', function () {
     if (!blob) return;
     blob.arrayBuffer().then(function (buf) {
-      window.opener.postMessage({ tip: 'nota-vocala', n: NONCE, mime: fmt[0].split(';')[0], ext: fmt[1], date: buf }, ORIGIN, [buf]);
+      window.opener.postMessage({ tip: 'nota-vocala', n: NONCE, mime: blob.type, ext: outExt, date: buf }, ORIGIN, [buf]);
       hint.textContent = 'Trimis. Te întorci în aplicație…';
       setTimeout(function () { window.close(); }, 300);
     }).catch(function () { fail('Înregistrarea nu a putut fi trimisă.'); });
